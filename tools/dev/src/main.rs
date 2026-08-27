@@ -41,6 +41,7 @@ enum Command {
     RustServices(RustServicesArgs),
     Infra(InfraArgs),
     Cassandra(CassandraArgs),
+    Migrate(MigrateArgs),
     Desktop(DesktopArgs),
     MediaProxy(MediaProxyArgs),
     Tunnel(TunnelArgs),
@@ -107,6 +108,22 @@ enum CassandraCommand {
     },
     Apply,
     Verify,
+}
+
+#[derive(Debug, Args)]
+struct MigrateArgs {
+    #[command(subcommand)]
+    command: MigrateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrateCommand {
+    /// Migrate all data from a Postgres KV store to ScyllaDB.
+    ///
+    /// Reads FLUXER_POSTGRES_* and FLUXER_CASSANDRA_* from the environment.
+    /// Optional: FLUXER_MIGRATE_TABLES (comma-separated list to migrate a subset),
+    ///           FLUXER_MIGRATE_DRY_RUN=true (validate without writing).
+    PostgresToScylla,
 }
 
 #[derive(Debug, Args)]
@@ -261,6 +278,12 @@ async fn main() -> Result<()> {
                 apply_schema(None).await?;
             }
             CassandraCommand::Verify => verify_schema(None, None).await?,
+        },
+        Command::Migrate(args) => match args.command {
+            MigrateCommand::PostgresToScylla => {
+                let config = fluxer_dev::migrate::MigrateConfig::from_env()?;
+                fluxer_dev::migrate::run_migrate(config).await?;
+            }
         },
         Command::Desktop(args) => match args.command {
             DesktopCommand::Deps => install_desktop_dependencies()?,

@@ -124,7 +124,7 @@ pub fn config_from_env() -> Result<CassandraConfig> {
     })
 }
 
-async fn connect(config: &CassandraConfig) -> Result<Session> {
+pub(crate) async fn connect(config: &CassandraConfig) -> Result<Session> {
     let contact = format!("{}:{}", config.host, config.port);
     let mut builder = SessionBuilder::new().known_node(contact);
     if let Some(username) = &config.username {
