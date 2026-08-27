@@ -1,0 +1,8 @@
+.env
+.env.*
+
+!.env.example
+
+# TLS keys for FLUXER_EDGE_TLS; never commit them.
+certs/*
+!certs/.gitkeep
