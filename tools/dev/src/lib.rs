@@ -10,6 +10,7 @@ pub mod env;
 pub mod gateway;
 pub mod manifest;
 pub mod media_proxy;
+pub mod migrate;
 pub mod object_store;
 pub mod paths;
 pub mod proc;
