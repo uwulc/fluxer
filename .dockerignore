@@ -16,6 +16,8 @@
 /config/env/local.env
 /deploy/self-hosting/.env.*
 !/deploy/self-hosting/.env.example
+/deploy/self-hosting-scylladb/.env.*
+!/deploy/self-hosting-scylladb/.env.example
 
 **/*.css.d.ts
 **/*.tsbuildinfo
