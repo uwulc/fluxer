@@ -28,6 +28,7 @@ pub struct CassandraConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExistingTable {
     pub columns: BTreeMap<String, String>,
+    pub default_time_to_live: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -203,6 +204,12 @@ struct ColumnRow {
 }
 
 #[derive(Debug, DeserializeRow)]
+struct TableOptionsRow {
+    table_name: String,
+    default_time_to_live: Option<i32>,
+}
+
+#[derive(Debug, DeserializeRow)]
 struct IndexRow {
     index_name: Option<String>,
 }
@@ -257,6 +264,21 @@ pub async fn fetch_existing_schema(session: &Session, keyspace: &str) -> Result<
             .or_default()
             .columns
             .insert(normalize_identifier(&row.column_name), row.column_type);
+    }
+
+    let table_option_rows = session
+        .query_unpaged(
+            "SELECT table_name, default_time_to_live FROM system_schema.tables WHERE keyspace_name = ?",
+            (keyspace,),
+        )
+        .await?
+        .into_rows_result()?
+        .rows::<TableOptionsRow>()?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for row in table_option_rows {
+        if let Some(table) = tables.get_mut(&normalize_identifier(&row.table_name)) {
+            table.default_time_to_live = row.default_time_to_live;
+        }
     }
 
     let index_rows = session
@@ -408,7 +430,7 @@ pub fn create_diff(existing: &ExistingSchema, keyspace: &str) -> SchemaDiff {
         for field in &user_type.fields {
             match current_fields.get(&field.name) {
                 None => statements.push(format!(
-                    "ALTER TYPE {keyspace}.{} ADD IF NOT EXISTS {} {}",
+                    "ALTER TYPE {keyspace}.{} ADD {} {}",
                     user_type.name, field.name, field.field_type
                 )),
                 Some(current_type)
@@ -433,7 +455,7 @@ pub fn create_diff(existing: &ExistingSchema, keyspace: &str) -> SchemaDiff {
         for field in &table.columns {
             match current_table.columns.get(&field.name) {
                 None => statements.push(format!(
-                    "ALTER TABLE {keyspace}.{} ADD IF NOT EXISTS {} {}",
+                    "ALTER TABLE {keyspace}.{} ADD {} {}",
                     table.name, field.name, field.field_type
                 )),
                 Some(current_type)
@@ -446,6 +468,13 @@ pub fn create_diff(existing: &ExistingSchema, keyspace: &str) -> SchemaDiff {
                 }
                 Some(_) => {}
             }
+        }
+        let target_ttl = target_default_time_to_live(&table.options);
+        if current_table.default_time_to_live.unwrap_or(0) != target_ttl {
+            statements.push(format!(
+                "ALTER TABLE {keyspace}.{} WITH default_time_to_live = {target_ttl}",
+                table.name
+            ));
         }
     }
     let mut indexes = schema.indexes.clone();
@@ -473,6 +502,18 @@ pub fn create_diff(existing: &ExistingSchema, keyspace: &str) -> SchemaDiff {
         errors,
         target_sha256: target_schema_sha256(keyspace),
     }
+}
+
+static DEFAULT_TTL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bdefault_time_to_live\s*=\s*(\d+)").expect("valid default TTL regex")
+});
+
+/// The `default_time_to_live` a target table declares in its options, 0 when none.
+fn target_default_time_to_live(options: &str) -> i32 {
+    DEFAULT_TTL_RE
+        .captures(options)
+        .and_then(|captures| captures[1].parse().ok())
+        .unwrap_or(0)
 }
 
 fn statement_with_semicolon(statement: &str) -> String {
@@ -613,4 +654,111 @@ async fn verify_schema_with_session(session: &Session, keyspace: &str) -> Result
         &diff.target_sha256[..12],
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn existing_from_target(keyspace_exists: bool) -> ExistingSchema {
+        let schema = target_schema();
+        ExistingSchema {
+            keyspace_exists,
+            types: schema
+                .user_types
+                .iter()
+                .map(|user_type| {
+                    let fields = user_type
+                        .fields
+                        .iter()
+                        .map(|field| (field.name.clone(), field.field_type.clone()))
+                        .collect();
+                    (user_type.name.clone(), fields)
+                })
+                .collect(),
+            tables: schema
+                .tables
+                .iter()
+                .map(|table| {
+                    let columns = table
+                        .columns
+                        .iter()
+                        .map(|field| (field.name.clone(), field.field_type.clone()))
+                        .collect();
+                    let ttl = target_default_time_to_live(&table.options);
+                    let existing = ExistingTable {
+                        columns,
+                        default_time_to_live: (ttl != 0).then_some(ttl),
+                    };
+                    (table.name.clone(), existing)
+                })
+                .collect(),
+            indexes: schema
+                .indexes
+                .iter()
+                .map(|index| index.name.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn matching_schema_needs_no_statements() {
+        let diff = create_diff(&existing_from_target(true), "fluxer");
+        assert_eq!(diff.statements, Vec::<String>::new());
+        assert!(diff.errors.is_empty());
+    }
+
+    #[test]
+    fn upgrade_statements_are_valid_on_scylladb() {
+        let mut existing = existing_from_target(true);
+        existing
+            .tables
+            .get_mut("users")
+            .unwrap()
+            .columns
+            .remove("content_hidden_since");
+        existing
+            .types
+            .get_mut("channel_override")
+            .unwrap()
+            .remove("flags");
+        existing
+            .tables
+            .get_mut("jobs_by_id")
+            .unwrap()
+            .default_time_to_live = None;
+        let diff = create_diff(&existing, "fluxer");
+        assert!(diff.errors.is_empty());
+        // ScyllaDB rejects ALTER ... ADD IF NOT EXISTS, and the diff only adds
+        // columns that are missing anyway.
+        assert!(
+            diff.statements
+                .iter()
+                .all(|s| !s.contains("ADD IF NOT EXISTS"))
+        );
+        assert!(
+            diff.statements.contains(
+                &"ALTER TABLE fluxer.users ADD content_hidden_since timestamp".to_owned()
+            )
+        );
+        assert!(
+            diff.statements
+                .contains(&"ALTER TYPE fluxer.channel_override ADD flags int".to_owned())
+        );
+        assert!(diff.statements.contains(
+            &"ALTER TABLE fluxer.jobs_by_id WITH default_time_to_live = 7776000".to_owned()
+        ));
+        assert_eq!(diff.statements.len(), 3);
+    }
+
+    #[test]
+    fn reads_default_ttl_from_table_options() {
+        assert_eq!(
+            target_default_time_to_live(
+                "CLUSTERING ORDER BY (created_at DESC) AND default_time_to_live = 7776000"
+            ),
+            7_776_000
+        );
+        assert_eq!(target_default_time_to_live(""), 0);
+    }
 }
