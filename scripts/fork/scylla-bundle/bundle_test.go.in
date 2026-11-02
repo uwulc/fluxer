@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Copied into fluxer_rexctl/internal/instance by rebuild.sh; it mirrors
+// cmd/bundle.go. It lives in package instance because instance imports stack.
+
+package instance
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/fluxerapp/fluxer/fluxer_rexctl/internal/stack"
+)
+
+func TestZZWriteBundle(t *testing.T) {
+	out := os.Getenv("BUNDLE_OUT")
+	if out == "" {
+		t.Skip("BUNDLE_OUT not set")
+	}
+	// An empty image set leaves the image lines alone.
+	if err := stack.Bundle(out, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]string{
+		".env.example":            BundleEnv(),
+		"voice/voice.env.example": VoiceBundleEnv(),
+		"voice/edge.env.example":  VoiceEdgeBundleEnv(),
+	} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
