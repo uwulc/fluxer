@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Fork image pipeline. Upstream's build-* workflows need upstream's GitHub App
+# and release environment, so the fork builds through this file instead.
+#
+# - Push to main: build every docker-bake.hcl target as :sha-<commit>, then
+#   point :dev at the set once all of it built.
+# - Push of a uwulc-* tag: point :<tag> and :latest at the :sha-<commit>
+#   images main already built (a registry-side copy, same digests), building
+#   them first only if any are missing.
+# - Manual run: same as a push of the selected ref. A branch other than main
+#   only gets :sha-<commit>.
+#
+# Builds run on the self-hosted runner labelled uwulc-builder, which reaches a
+# BuildKit daemon at unix:///run/buildkit/buildkitd.sock. The `hosted` input
+# builds on a GitHub-hosted runner instead (cold cache, much slower).
+name: uwulc images
+
+on:
+  push:
+    branches: [main]
+    tags: ['uwulc-*']
+  workflow_dispatch:
+    inputs:
+      hosted:
+        description: "Build on a GitHub-hosted runner instead of the self-hosted builder (no warm cache: slow)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: uwulc-images-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  SHA_TAG: sha-${{ github.sha }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      images: ${{ steps.plan.outputs.images }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: list images and decide whether to build
+        id: plan
+        run: |
+          set -euo pipefail
+          images="$(docker buildx bake --print 2>/dev/null | jq -r '.group.default.targets | join(" ")')"
+          echo "images=${images}" >> "$GITHUB_OUTPUT"
+
+          build=true
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            build=false
+            for image in $images; do
+              if ! docker buildx imagetools inspect "${REGISTRY}/${image}:${SHA_TAG}" >/dev/null 2>&1; then
+                echo "${image}:${SHA_TAG} is missing"
+                build=true
+              fi
+            done
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "images: ${images}"
+          echo "build: ${build}"
+
+  build:
+    name: build ${{ inputs.hosted && '(hosted)' || '(uwulc-builder)' }}
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ${{ inputs.hosted && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","uwulc-builder"]') }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: free disk space (hosted)
+        if: inputs.hosted
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: set up buildx (self-hosted BuildKit)
+        if: ${{ !inputs.hosted }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+        with:
+          driver: remote
+          endpoint: unix:///run/buildkit/buildkitd.sock
+      - name: set up buildx (hosted)
+        if: inputs.hosted
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: build and push :${{ env.SHA_TAG }}
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        run: |
+          set -euo pipefail
+          BUILD_VERSION="$(date -u +%Y.%-m%d).$((10#$(date -u +%H%M%S)))"
+          SOURCE_DATE="$(TZ=UTC git log -1 --no-show-signature --pretty=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"
+          export REGISTRY TAG="$SHA_TAG" SOURCE_SHA="$GITHUB_SHA" BUILD_VERSION SOURCE_DATE
+          echo "BUILD_VERSION=${BUILD_VERSION}"
+          docker buildx bake --file docker-bake.hcl --push
+          {
+            echo "### Built ${SHA_TAG}"
+            echo
+            echo "BUILD_VERSION \`${BUILD_VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: promote
+    needs: [plan, build]
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: tag the image set
+        env:
+          IMAGES: ${{ needs.plan.outputs.images }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tags=("$GITHUB_REF_NAME" latest)
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tags=(dev)
+          else
+            echo "Not main or a uwulc-* tag: leaving only :${SHA_TAG}."
+            exit 0
+          fi
+
+          echo "### Promoted ${SHA_TAG} to ${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          for image in $IMAGES; do
+            args=()
+            for tag in "${tags[@]}"; do
+              args+=(--tag "${REGISTRY}/${image}:${tag}")
+            done
+            docker buildx imagetools create "${args[@]}" "${REGISTRY}/${image}:${SHA_TAG}"
+            digest="$(docker buildx imagetools inspect "${REGISTRY}/${image}:${SHA_TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            echo "- \`${image}\` ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          done
